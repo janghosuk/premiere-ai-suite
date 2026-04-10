@@ -265,33 +265,88 @@ def transnet_predict(model, frames: "np.ndarray", log_fn) -> "np.ndarray":
     return all_preds[:len(frames)]
 
 
-def predictions_to_scenes(preds: "np.ndarray", threshold: float = 0.5) -> list:
+def predictions_to_scenes(preds: "np.ndarray",
+                          threshold: float = 0.5,
+                          min_scene_frames: int = 15) -> list:
     """
     TransNetV2 예측값 → 장면 경계 (프레임 인덱스 기준).
-    반환: [(start_frame, end_frame), ...]
+
+    핵심 로직:
+    1) Peak detection — threshold 위 연속 구간에서 '가장 높은' 프레임 1개만 cut으로 채택
+       (dissolve/fade처럼 여러 프레임이 같이 켜지는 경우 False Positive 방지)
+    2) Minimum distance 강제 — cut 사이 간격이 min_scene_frames 미만이면
+       확률이 낮은 쪽을 제거해 너무 짧은 장면이 나오는 것 방지
+
+    Args:
+        preds: [T] 프레임별 sigmoid 확률 (0~1)
+        threshold: peak 높이 임계값
+        min_scene_frames: 두 cut 사이 최소 프레임 수
+
+    Returns:
+        [(start_frame, end_frame), ...] (반열림 구간의 정수 인덱스)
     """
-    binary = (preds > threshold).astype(np.uint8)
+    n = len(preds)
+    if n == 0:
+        return []
+
+    # ── 1단계: threshold 위 연속 구간에서 peak만 추출 ──
+    cut_points = []  # cut 프레임 인덱스
+    i = 0
+    while i < n:
+        if preds[i] >= threshold:
+            # 이 연속 구간의 peak 찾기
+            peak_idx = i
+            peak_val = float(preds[i])
+            j = i + 1
+            while j < n and preds[j] >= threshold:
+                if float(preds[j]) > peak_val:
+                    peak_idx = j
+                    peak_val = float(preds[j])
+                j += 1
+            cut_points.append(peak_idx)
+            i = j  # 이 구간 건너뛰기
+        else:
+            i += 1
+
+    # ── 2단계: 최소 거리 강제 ──
+    if min_scene_frames > 0 and len(cut_points) > 1:
+        filtered = [cut_points[0]]
+        for c in cut_points[1:]:
+            if c - filtered[-1] >= min_scene_frames:
+                filtered.append(c)
+            else:
+                # 너무 가까움 — 확률 더 높은 쪽만 유지
+                if float(preds[c]) > float(preds[filtered[-1]]):
+                    filtered[-1] = c
+        cut_points = filtered
+
+    # ── 3단계: cut 지점 → 장면 구간 변환 ──
+    if not cut_points:
+        return [(0, n - 1)]
+
     scenes = []
-    start = 0
     prev = 0
-    end_i = 0
-    for i, v in enumerate(binary):
-        if prev == 1 and v == 0:
-            start = i
-        if prev == 0 and v == 1 and i != 0:
-            scenes.append([start, i])
-        prev = v
-        end_i = i
-    # 마지막 장면 마무리
-    if prev == 0:
-        scenes.append([start, end_i])
+    for c in cut_points:
+        if c > prev:
+            scenes.append((int(prev), int(c - 1)))
+        prev = c
+    # 마지막 구간
+    if prev < n:
+        scenes.append((int(prev), int(n - 1)))
 
-    if len(scenes) == 0:
-        return [(0, len(preds) - 1)]
-    return [(int(s), int(e)) for s, e in scenes]
+    # 첫 장면 길이 체크 (min_scene_frames 미만이면 다음 장면에 병합)
+    if len(scenes) >= 2:
+        first_start, first_end = scenes[0]
+        if (first_end - first_start + 1) < min_scene_frames:
+            _, second_end = scenes[1]
+            scenes[0] = (first_start, second_end)
+            scenes.pop(1)
+
+    return scenes
 
 
-def detect_scenes_transnet(video_path: str, threshold: float, log_fn) -> list:
+def detect_scenes_transnet(video_path: str, threshold: float,
+                            min_scene_sec: float, log_fn) -> list:
     """TransNetV2로 장면 탐지. [(start_sec, end_sec), ...] 반환"""
     if not NUMPY_AVAILABLE:
         raise RuntimeError("numpy 필요: pip install numpy")
@@ -335,14 +390,26 @@ def detect_scenes_transnet(video_path: str, threshold: float, log_fn) -> list:
     preds = transnet_predict(model, frames, log_fn)
     log_fn(f"  ✓ 추론 완료 ({time.time()-t0:.1f}초)", "success")
 
-    # 5. 프레임 → 시간 변환
+    # 5. FPS 계산
     fps = get_video_fps(video_path)
     log_fn(f"  ✓ FPS: {fps:.2f}", "info")
 
-    scene_frames = predictions_to_scenes(preds, threshold=threshold)
+    # 6. Peak detection + 최소 거리 필터
+    min_frames = max(1, int(round(min_scene_sec * fps)))
+    log_fn(f"  설정: threshold={threshold:.2f}, 최소 장면={min_scene_sec:.2f}s "
+           f"({min_frames} 프레임)", "info")
+
+    # 진단: raw prediction 분포
+    raw_peaks = int((preds > threshold).sum())
+    log_fn(f"  raw peak 프레임 수: {raw_peaks} "
+           f"(max={float(preds.max()):.3f}, mean={float(preds.mean()):.3f})", "info")
+
+    scene_frames = predictions_to_scenes(preds, threshold=threshold,
+                                          min_scene_frames=min_frames)
     cuts = [(s / fps, (e + 1) / fps) for s, e in scene_frames]
 
-    log_fn(f"✓ TransNetV2가 {len(cuts)}개 컷 감지", "success")
+    log_fn(f"✓ TransNetV2가 {len(cuts)}개 컷 감지 "
+           f"(False Positive 필터링 후)", "success")
     return cuts
 
 
@@ -381,6 +448,8 @@ class SceneSplitterApp:
         self.mode = tk.StringVar(value="transnet")  # transnet | pyscenedetect
         self.transnet_threshold = tk.DoubleVar(value=0.5)
         self.transnet_threshold_text = tk.StringVar(value="0.50")
+        self.min_scene_sec = tk.DoubleVar(value=0.6)
+        self.min_scene_sec_text = tk.StringVar(value="0.6s")
         self.threshold = tk.DoubleVar(value=27.0)
         self.threshold_text = tk.StringVar(value="27.0")
         self.detector_type = tk.StringVar(value="content")
@@ -505,17 +574,34 @@ class SceneSplitterApp:
 
         # TransNetV2 옵션
         self.transnet_opts = ttk.Frame(self.options_frame, style="App.TFrame")
+
+        # 1) Threshold
         trow = ttk.Frame(self.transnet_opts, style="App.TFrame")
-        trow.pack(fill="x", pady=(0, 4))
-        ttk.Label(trow, text="민감도 (TransNetV2)", style="Field.TLabel").pack(side="left")
+        trow.pack(fill="x", pady=(0, 2))
+        ttk.Label(trow, text="Threshold (cut 감지 강도)",
+                  style="Field.TLabel").pack(side="left")
         ttk.Label(trow, textvariable=self.transnet_threshold_text,
                   style="Value.TLabel").pack(side="right")
         ttk.Scale(self.transnet_opts, from_=0.1, to=0.9,
                   variable=self.transnet_threshold, orient="horizontal",
                   command=lambda v: self.transnet_threshold_text.set(f"{float(v):.2f}")).pack(
-                      fill="x", pady=(4, 4))
+                      fill="x", pady=(2, 2))
         ttk.Label(self.transnet_opts,
-                  text="낮을수록 민감 (더 많이 자름). 기본 0.5 권장. GPU 있으면 자동 사용.",
+                  text="높을수록 엄격 (False Positive 감소). 권장 0.5~0.7",
+                  style="Hint.TLabel").pack(anchor="w")
+
+        # 2) 최소 장면 길이 — False Positive 억제용
+        mrow = ttk.Frame(self.transnet_opts, style="App.TFrame")
+        mrow.pack(fill="x", pady=(10, 2))
+        ttk.Label(mrow, text="최소 장면 길이", style="Field.TLabel").pack(side="left")
+        ttk.Label(mrow, textvariable=self.min_scene_sec_text,
+                  style="Value.TLabel").pack(side="right")
+        ttk.Scale(self.transnet_opts, from_=0.1, to=3.0,
+                  variable=self.min_scene_sec, orient="horizontal",
+                  command=lambda v: self.min_scene_sec_text.set(f"{float(v):.1f}s")).pack(
+                      fill="x", pady=(2, 2))
+        ttk.Label(self.transnet_opts,
+                  text="이 값보다 짧은 장면은 자동 병합. 과분할(컷 아닌데 잘림) 방지.",
                   style="Hint.TLabel").pack(anchor="w")
 
         # PySceneDetect 옵션
@@ -679,7 +765,10 @@ class SceneSplitterApp:
             if self.mode.get() == "transnet":
                 try:
                     cuts = detect_scenes_transnet(
-                        input_path, self.transnet_threshold.get(), self._log)
+                        input_path,
+                        self.transnet_threshold.get(),
+                        self.min_scene_sec.get(),
+                        self._log)
                 except Exception as e:
                     self._log(f"✗ TransNetV2 실패: {e}", "error")
                     if PYSCENEDETECT_AVAILABLE:
