@@ -1,2 +1,7 @@
+# TransNetV2 (AI 딥러닝 기반 Scene Edit Detection - 권장)
+torch>=2.0.0
+transnetv2-pytorch>=1.0.0
+numpy>=1.24.0
+
+# PySceneDetect (경량 폴백 옵션)
 scenedetect[opencv]>=0.6.4
-requests>=2.31.0

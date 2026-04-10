@@ -1,42 +1,62 @@
 """
-Scene Splitter — 장면 편집 탐지로 영상을 컷 단위로 분할
-- 모드 1: Premiere Pro의 Scene Edit Detection 사용 (Premiere Pro 실행 + Pymiere Link 필요)
-- 모드 2: PySceneDetect 사용 (오프라인, ffmpeg만 있으면 됨)
+Scene Splitter — 딥러닝 기반 자동 장면 편집 탐지
+─────────────────────────────────────────────────────
+Premiere Pro의 'Scene Edit Detection' (Adobe Sensei) 기능을 대체하는 오픈소스 도구.
+
+탐지 엔진:
+  1) TransNetV2 (기본, 권장)
+     - soCzech/TransNetV2 - 딥러닝 기반 Shot Boundary Detection SOTA 모델
+     - Adobe Sensei와 동급 수준의 정확도
+     - https://github.com/soCzech/TransNetV2
+  2) PySceneDetect (폴백)
+     - 전통적 컨텐츠 비교 방식
+
 각 컷의 첫 프레임은 JPEG 섬네일로 자동 저장됩니다.
 """
 
 import os
 import sys
 import io
-import json
 import time
 import threading
 import shutil
 import subprocess
+import urllib.request
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# UTF-8 출력 (Windows cp949 호환)
+# UTF-8 출력
 try:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 except Exception:
     pass
 
-# PySceneDetect (오프라인 모드)
+# ─── 선택적 의존성 ───
 try:
     from scenedetect import detect, ContentDetector, AdaptiveDetector, ThresholdDetector
     PYSCENEDETECT_AVAILABLE = True
 except ImportError:
     PYSCENEDETECT_AVAILABLE = False
 
-# Pymiere (Premiere Pro 모드) - HTTP 직접 호출이라 requests만 있으면 됨
 try:
-    import requests
-    REQUESTS_AVAILABLE = True
+    import numpy as np
+    NUMPY_AVAILABLE = True
 except ImportError:
-    REQUESTS_AVAILABLE = False
+    NUMPY_AVAILABLE = False
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+try:
+    from transnetv2_pytorch import TransNetV2
+    TRANSNET_AVAILABLE = True
+except ImportError:
+    TRANSNET_AVAILABLE = False
 
 
 # ─── Claude 스타일 컬러 ───
@@ -52,30 +72,33 @@ ACCENT_HOVER = "#e88a6a"
 SUCCESS = "#7fb87f"
 ERROR = "#e07a7a"
 
-PYMIERE_URL = "http://127.0.0.1:3000"
+# TransNetV2 가중치 (Hugging Face, ~30MB, 1회만 다운로드)
+TRANSNET_WEIGHTS_URL = (
+    "https://huggingface.co/Sn4kehead/TransNetV2/resolve/main/"
+    "transnetv2-pytorch-weights.pth"
+)
 
 
 def get_desktop_path() -> Path:
-    """OS별 데스크탑 경로 (한국어 Windows 포함)"""
     home = Path.home()
-    candidates = [
-        home / "Desktop",
-        home / "바탕 화면",
-        home / "OneDrive" / "Desktop",
-        home / "OneDrive" / "바탕 화면",
-    ]
-    for p in candidates:
+    for p in [home / "Desktop", home / "바탕 화면",
+              home / "OneDrive" / "Desktop", home / "OneDrive" / "바탕 화면"]:
         if p.exists():
             return p
     return home
+
+
+def get_cache_dir() -> Path:
+    cache = Path.home() / ".cache" / "scene_splitter"
+    cache.mkdir(parents=True, exist_ok=True)
+    return cache
 
 
 def check_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def run_ffmpeg(args: list, timeout: int = 120) -> tuple:
-    """ffmpeg 실행. (success, stderr) 반환."""
+def run_ffmpeg(args: list, timeout: int = 180) -> tuple:
     try:
         result = subprocess.run(
             ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"] + args,
@@ -90,20 +113,21 @@ def run_ffmpeg(args: list, timeout: int = 120) -> tuple:
 
 
 def extract_jpeg_frame(video_path: str, time_sec: float, output_path: str) -> bool:
-    """주어진 시간 지점의 프레임을 고품질 JPEG로 저장"""
+    """고품질 JPEG 섬네일 추출"""
     args = [
         "-ss", f"{time_sec:.3f}",
         "-i", video_path,
         "-frames:v", "1",
-        "-q:v", "2",  # 고품질 (1=최고, 31=최저)
+        "-q:v", "2",
         output_path,
     ]
     ok, _ = run_ffmpeg(args, timeout=30)
     return ok
 
 
-def split_video_segment(video_path: str, start_sec: float, end_sec: float, output_path: str) -> bool:
-    """ffmpeg 스트림 카피로 영상 구간 추출 (무손실, 빠름)"""
+def split_video_segment(video_path: str, start_sec: float, end_sec: float,
+                        output_path: str) -> bool:
+    """ffmpeg 스트림 카피 (무손실, 빠름)"""
     args = [
         "-ss", f"{start_sec:.3f}",
         "-to", f"{end_sec:.3f}",
@@ -113,399 +137,220 @@ def split_video_segment(video_path: str, start_sec: float, end_sec: float, outpu
         "-avoid_negative_ts", "make_zero",
         output_path,
     ]
-    ok, _ = run_ffmpeg(args, timeout=120)
+    ok, _ = run_ffmpeg(args, timeout=180)
     return ok
 
 
-# ─── Pymiere Link HTTP 클라이언트 ───
-def pymiere_eval(script: str, timeout: int = 60) -> str:
-    """Premiere Pro에 ExtendScript 실행 요청"""
-    if not REQUESTS_AVAILABLE:
-        raise RuntimeError("requests 라이브러리가 필요합니다: pip install requests")
-    response = requests.post(
-        PYMIERE_URL,
-        json={"to_eval": script},
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    return response.text
-
-
-def pymiere_check_connection() -> bool:
-    """Premiere Pro에 연결 가능한지 확인"""
-    if not REQUESTS_AVAILABLE:
-        return False
+def get_video_fps(video_path: str) -> float:
+    """ffprobe로 영상 FPS 조회"""
     try:
-        result = pymiere_eval("app.version", timeout=5)
-        return bool(result and result.strip())
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        rate = result.stdout.strip()
+        if "/" in rate:
+            num, den = rate.split("/")
+            return float(num) / float(den) if float(den) != 0 else 25.0
+        return float(rate)
     except Exception:
-        return False
+        return 25.0
 
 
-# ─── Premiere Pro Scene Edit Detection ───
-#
-# 근본 문제 분석:
-# - Adobe Sensei 기반 Scene Edit Detection은 비동기 ML 작업
-# - 단일 JSX 호출 내에서 $.sleep으로 대기하면 ExtendScript가 메인 UI 스레드를 점유해
-#   백그라운드 ML 처리까지 멈춰버림
-# - 따라서 여러 Python 호출로 쪼개 Premiere가 실제 처리할 시간을 확보해야 함
-#
-# 전략:
-#   STEP 1 (setup):     프로젝트 확보 → 영상 임포트 → 시퀀스 생성 → 클립 선택
-#   STEP 2 (diagnose):  QE DOM 메서드 enumerate — setSceneEditDetection 존재 확인
-#   STEP 3 (trigger):   setSceneEditDetection 호출. 즉시 return
-#   STEP 4 (poll loop): Python이 주기적으로 클립 수를 조회 → 안정화 감지
-#   STEP 5 (read):      최종 컷 경계 읽기
+# ─── TransNetV2 (딥러닝 SOTA) ───
+def download_transnet_weights(dest: Path, log_fn) -> None:
+    """HuggingFace에서 TransNetV2 가중치 다운로드 (최초 1회)"""
+    log_fn(f"TransNetV2 가중치 다운로드 중 (~30MB)...", "info")
+    log_fn(f"  {TRANSNET_WEIGHTS_URL}", "info")
 
-# ── STEP 1: 프로젝트/시퀀스/선택 준비 ──
-JSX_SETUP = r"""
-(function() {
-    try {
-        var videoPath = "__VIDEO_PATH__";
-
-        // 프로젝트가 없으면 생성 (엉뚱한 상태 방지)
-        if (!app.project || !app.project.rootItem) {
-            return JSON.stringify({error: "열린 프로젝트 없음. Premiere에서 프로젝트를 먼저 여세요."});
-        }
-
-        // 1. 영상 임포트
-        var beforeCount = app.project.rootItem.children.numItems;
-        var ok = app.project.importFiles([videoPath], true, app.project.rootItem, false);
-        if (!ok) { return JSON.stringify({error: "importFiles 반환값 false"}); }
-
-        // 2. 임포트된 아이템 찾기
-        var imported = null;
-        var children = app.project.rootItem.children;
-        for (var i = beforeCount; i < children.numItems; i++) {
-            var child = children[i];
-            if (child && child.type !== undefined && child.type !== 3 /* BIN */) {
-                imported = child;
-                break;
-            }
-        }
-        if (!imported && children.numItems > beforeCount) {
-            imported = children[beforeCount];
-        }
-        if (!imported) { return JSON.stringify({error: "임포트된 아이템을 못 찾음"}); }
-
-        // 3. 미디어 분석 완료 대기 (최대 10초)
-        //    importFiles 직후엔 메타데이터가 아직 준비 안 될 수 있음
-        var mediaWait = 0;
-        while (mediaWait < 20) {
-            try {
-                var mp = imported.getMediaPath();
-                if (mp && mp.length > 0) break;
-            } catch (mpErr) {}
-            $.sleep(500);
-            mediaWait++;
-        }
-
-        // 4. 시퀀스 생성
-        var seqName = "SceneDetect_" + (new Date()).getTime();
-        app.project.createNewSequenceFromClips(seqName, [imported], app.project.rootItem);
-        var seq = app.project.activeSequence;
-        if (!seq) { return JSON.stringify({error: "시퀀스 생성 실패"}); }
-
-        // 5. 시퀀스를 명시적으로 active로 설정
-        app.project.activeSequence = seq;
-
-        // 6. 비디오 트랙 클립 선택
-        var track = seq.videoTracks[0];
-        if (!track || track.clips.numItems === 0) {
-            return JSON.stringify({error: "비디오 트랙에 클립 없음"});
-        }
-        for (var k = 0; k < track.clips.numItems; k++) {
-            track.clips[k].setSelected(true, k === 0);
-        }
-
-        return JSON.stringify({
-            ok: true,
-            sequenceName: seqName,
-            initialCount: track.clips.numItems,
-            mediaWaitSec: mediaWait * 0.5,
-            pproVersion: app.version
-        });
-    } catch (e) {
-        return JSON.stringify({error: "SETUP 예외: " + e.toString(), line: (e.line || "?")});
-    }
-})();
-"""
-
-# ── STEP 2: QE DOM 메서드 enumerate (진단용) ──
-JSX_DIAGNOSE = r"""
-(function() {
-    try {
-        app.enableQE();
-        if (typeof qe === "undefined" || !qe) {
-            return JSON.stringify({error: "qe 객체 자체가 없음. QE DOM 미지원 버전."});
-        }
-        var qeSeq = qe.project.getActiveSequence();
-        if (!qeSeq) { return JSON.stringify({error: "qe.project.getActiveSequence() null"}); }
-
-        var qeTrack = qeSeq.getVideoTrackAt(0);
-        if (!qeTrack) { return JSON.stringify({error: "qe 비디오 트랙 null"}); }
-
-        var numItems = qeTrack.numItems;
-        var qeClip = qeTrack.getItemAt(0);
-        if (!qeClip) { return JSON.stringify({error: "qe 클립 null", numItems: numItems}); }
-
-        // 클립에서 setSceneEditDetection 메서드 존재 확인
-        var hasMethod = (typeof qeClip.setSceneEditDetection === "function");
-
-        // 사용 가능한 메서드 리스트
-        var methods = [];
-        for (var key in qeClip) {
-            try {
-                if (typeof qeClip[key] === "function") methods.push(key);
-            } catch (_) {}
-        }
-
-        return JSON.stringify({
-            ok: true,
-            hasSetSceneEditDetection: hasMethod,
-            qeTrackNumItems: numItems,
-            qeClipType: (qeClip.type || "?"),
-            qeClipName: (qeClip.name || "?"),
-            methods: methods.join(",")
-        });
-    } catch (e) {
-        return JSON.stringify({error: "DIAGNOSE 예외: " + e.toString()});
-    }
-})();
-"""
-
-# ── STEP 3: Scene Edit Detection 호출 (여러 시그니처 시도) ──
-JSX_TRIGGER = r"""
-(function() {
-    try {
-        var applyCuts = __APPLY_CUTS__;
-        var createBins = __CREATE_BINS__;
-        var createMarkers = __CREATE_MARKERS__;
-
-        app.enableQE();
-        var qeSeq = qe.project.getActiveSequence();
-        if (!qeSeq) { return JSON.stringify({error: "active qe sequence 없음"}); }
-
-        var qeTrack = qeSeq.getVideoTrackAt(0);
-        var qeClip = qeTrack.getItemAt(0);
-        if (!qeClip) { return JSON.stringify({error: "qe 클립 없음"}); }
-
-        if (typeof qeClip.setSceneEditDetection !== "function") {
-            return JSON.stringify({
-                error: "setSceneEditDetection 메서드가 QE 클립에 존재하지 않음",
-                hint: "Premiere Pro 2020 (14.3) 이상 + 호환 GPU 필요"
-            });
-        }
-
-        // 호출 시도 — 3-arg 형식
-        var called = false;
-        var lastErr = null;
-        var usedSignature = null;
-
-        try {
-            qeClip.setSceneEditDetection(applyCuts, createBins, createMarkers);
-            called = true;
-            usedSignature = "3-arg";
-        } catch (e3) {
-            lastErr = e3.toString();
-            // 1-arg 폴백
-            try {
-                qeClip.setSceneEditDetection(applyCuts);
-                called = true;
-                usedSignature = "1-arg";
-            } catch (e1) {
-                lastErr = lastErr + " | 1-arg: " + e1.toString();
-            }
-        }
-
-        if (!called) {
-            return JSON.stringify({error: "호출 실패: " + lastErr});
-        }
-
-        return JSON.stringify({ok: true, usedSignature: usedSignature});
-    } catch (e) {
-        return JSON.stringify({error: "TRIGGER 예외: " + e.toString()});
-    }
-})();
-"""
-
-# ── STEP 4: 현재 타임라인 클립 수 조회 ──
-JSX_POLL_COUNT = r"""
-(function() {
-    try {
-        var seq = app.project.activeSequence;
-        if (!seq) { return JSON.stringify({error: "active sequence 없음"}); }
-        var track = seq.videoTracks[0];
-        if (!track) { return JSON.stringify({error: "비디오 트랙 없음"}); }
-        return JSON.stringify({count: track.clips.numItems});
-    } catch (e) {
-        return JSON.stringify({error: e.toString()});
-    }
-})();
-"""
-
-# ── STEP 5: 최종 컷 경계 읽기 ──
-JSX_READ_CUTS = r"""
-(function() {
-    try {
-        var seq = app.project.activeSequence;
-        if (!seq) { return JSON.stringify({error: "active sequence 없음"}); }
-        var track = seq.videoTracks[0];
-        var TPS = 254016000000;
-        var cuts = [];
-        for (var j = 0; j < track.clips.numItems; j++) {
-            var c = track.clips[j];
-            cuts.push({
-                start: c.start.ticks / TPS,
-                end: c.end.ticks / TPS
-            });
-        }
-        return JSON.stringify({ok: true, cuts: cuts, count: cuts.length});
-    } catch (e) {
-        return JSON.stringify({error: e.toString()});
-    }
-})();
-"""
-
-
-def _jsx_call(script: str, timeout: int = 120) -> dict:
-    """JSX 실행 후 JSON 파싱"""
-    raw = pymiere_eval(script, timeout=timeout)
-    raw = (raw or "").strip()
-    if not raw:
-        raise RuntimeError("Premiere가 빈 응답 반환")
+    tmp = dest.with_suffix(".tmp")
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        raise RuntimeError(f"JSON 파싱 실패: {raw[:300]}")
+        def reporthook(blocks, block_size, total_size):
+            if total_size > 0:
+                pct = min(100, blocks * block_size * 100 // total_size)
+                if pct % 10 == 0 and blocks * block_size <= total_size:
+                    log_fn(f"  진행: {pct}%", "info")
+
+        urllib.request.urlretrieve(TRANSNET_WEIGHTS_URL, str(tmp), reporthook)
+        tmp.rename(dest)
+        log_fn(f"✓ 가중치 저장: {dest}", "success")
+    except Exception as e:
+        if tmp.exists():
+            tmp.unlink()
+        raise RuntimeError(f"가중치 다운로드 실패: {e}")
 
 
-def detect_scenes_premiere(video_path: str, apply_cuts: bool,
-                           create_bins: bool, create_markers: bool,
-                           log_fn) -> list:
+def extract_frames_transnet(video_path: str, log_fn) -> "np.ndarray":
     """
-    Premiere Pro Scene Edit Detection — 멀티 스텝 폴링 방식.
-    Adobe Sensei가 비동기 ML로 처리하므로 각 단계 사이에 Premiere에 시간 확보.
+    ffmpeg로 영상 프레임을 TransNetV2 입력 형식으로 추출.
+    TransNetV2는 48x27 RGB24 고정 해상도 입력을 요구.
     """
-    log_fn("Premiere Pro에 연결 중...", "info")
-    if not pymiere_check_connection():
-        raise RuntimeError(
-            "Premiere Pro에 연결할 수 없습니다.\n"
-            "1) Premiere Pro가 실행 중이고 프로젝트가 열려 있는지 확인\n"
-            "2) Pymiere Link CEP 확장이 설치/활성화되었는지 확인\n"
-            "   (localhost:3000에서 응답해야 함)"
-        )
-
-    # ── STEP 1: Setup ──
-    log_fn("[1/5] 영상 임포트 + 시퀀스 생성...", "info")
-    safe_path = video_path.replace("\\", "\\\\").replace('"', '\\"')
-    setup_script = JSX_SETUP.replace("__VIDEO_PATH__", safe_path)
-    data = _jsx_call(setup_script, timeout=120)
-    if "error" in data:
-        raise RuntimeError(f"Setup 실패: {data['error']}")
-    seq_name = data.get("sequenceName", "?")
-    initial = data.get("initialCount", "?")
-    ppro_ver = data.get("pproVersion", "?")
-    log_fn(f"  ✓ Premiere {ppro_ver} / 시퀀스: {seq_name}", "success")
-    log_fn(f"  ✓ 초기 클립 수: {initial}", "info")
-
-    # ── STEP 2: Diagnose — setSceneEditDetection이 실제로 있는지 확인 ──
-    log_fn("[2/5] QE DOM 진단 중...", "info")
-    data = _jsx_call(JSX_DIAGNOSE, timeout=30)
-    if "error" in data:
-        raise RuntimeError(f"진단 실패: {data['error']}")
-
-    has_method = data.get("hasSetSceneEditDetection", False)
-    if not has_method:
-        methods = data.get("methods", "")
-        raise RuntimeError(
-            "setSceneEditDetection 메서드가 QE DOM 클립에 존재하지 않습니다.\n"
-            f"Premiere Pro 버전 호환성 문제일 가능성이 높습니다.\n"
-            f"사용 가능한 메서드: {methods[:500]}"
-        )
-    log_fn("  ✓ setSceneEditDetection 메서드 확인됨", "success")
-
-    # ── STEP 3: Trigger (비동기 호출) ──
-    log_fn("[3/5] Scene Edit Detection 실행 트리거...", "info")
-    trigger_script = (
-        JSX_TRIGGER
-        .replace("__APPLY_CUTS__", "true" if apply_cuts else "false")
-        .replace("__CREATE_BINS__", "true" if create_bins else "false")
-        .replace("__CREATE_MARKERS__", "true" if create_markers else "false")
+    log_fn("ffmpeg로 프레임 추출 중 (48x27 RGB24)...", "info")
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", video_path,
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "48x27",
+        "pipe:",
+    ]
+    proc = subprocess.run(
+        cmd, capture_output=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
-    data = _jsx_call(trigger_script, timeout=60)
-    if "error" in data:
-        hint = data.get("hint", "")
-        msg = f"트리거 실패: {data['error']}"
-        if hint:
-            msg += f"\n힌트: {hint}"
-        raise RuntimeError(msg)
-    log_fn(f"  ✓ 트리거 완료 (시그니처: {data.get('usedSignature', '?')})", "success")
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg 프레임 추출 실패: {proc.stderr.decode(errors='replace')[:300]}")
 
-    # ── STEP 4: Poll — 클립 수가 안정될 때까지 대기 ──
-    log_fn("[4/5] 감지 진행 중 폴링...", "info")
-    log_fn("  ⚠ Adobe Sensei ML 분석 중. 영상 길이에 비례해 시간 소요.", "info")
+    frame_bytes = proc.stdout
+    expected_frame_size = 48 * 27 * 3
+    total_frames = len(frame_bytes) // expected_frame_size
+    if total_frames == 0:
+        raise RuntimeError("프레임이 0개 추출됨")
 
-    last_count = int(initial) if isinstance(initial, int) else 1
-    stable_secs = 0
-    total_waited = 0
-    poll_interval = 3  # seconds
-    stable_threshold = 15  # 15초 이상 변화 없으면 완료로 판단
-    max_wait = 1800  # 최대 30분
+    frames = np.frombuffer(frame_bytes, np.uint8).reshape(-1, 27, 48, 3)
+    log_fn(f"  ✓ {len(frames)} 프레임 추출", "success")
+    return frames
 
-    while total_waited < max_wait:
-        time.sleep(poll_interval)
-        total_waited += poll_interval
-        try:
-            data = _jsx_call(JSX_POLL_COUNT, timeout=15)
-        except Exception as e:
-            log_fn(f"  폴링 일시 실패 ({e}), 재시도...", "info")
-            continue
 
-        if "error" in data:
-            log_fn(f"  폴링 에러: {data['error']}", "info")
-            continue
+def transnet_predict(model, frames: "np.ndarray", log_fn) -> "np.ndarray":
+    """
+    TransNetV2 슬라이딩 윈도우 추론.
+    모델은 100프레임 윈도우 중 가운데 50프레임의 예측만 사용.
+    각 프레임당 [0, 1] scene boundary 확률 점수 반환.
+    """
+    log_fn("TransNetV2 추론 중...", "info")
 
-        current = data.get("count", 0)
-        if current != last_count:
-            log_fn(f"  [{total_waited}s] 클립 수: {last_count} → {current}", "info")
-            last_count = current
-            stable_secs = 0
-        else:
-            stable_secs += poll_interval
-            if current > 1 and stable_secs >= stable_threshold:
-                log_fn(f"  ✓ 안정화 감지 ({current}개, {stable_secs}s 안정)", "success")
-                break
-            if total_waited % 15 == 0:
-                log_fn(f"  [{total_waited}s] 대기 중... 현재 {current}개", "info")
+    # 25 프레임 시작 패딩 + 프레임들 + 25 프레임 끝 패딩 (100 배수 맞춤)
+    no_pad_start = 25
+    remainder = len(frames) % 50
+    no_pad_end = 25 + (50 - remainder if remainder != 0 else 0)
 
-    if last_count <= 1:
+    start_frame = np.expand_dims(frames[0], 0)
+    end_frame = np.expand_dims(frames[-1], 0)
+    padded = np.concatenate(
+        [start_frame] * no_pad_start + [frames] + [end_frame] * no_pad_end, axis=0
+    )
+
+    predictions = []
+    ptr = 0
+    device = next(model.parameters()).device
+
+    total_windows = (len(padded) - 100) // 50 + 1
+    window_idx = 0
+
+    while ptr + 100 <= len(padded):
+        window = padded[ptr:ptr + 100]  # [100, 27, 48, 3]
+        inp = torch.from_numpy(window[np.newaxis]).to(device)  # [1, 100, 27, 48, 3]
+
+        with torch.no_grad():
+            output = model(inp)
+            # use_many_hot_targets=True → (one_hot, {"many_hot": ...})
+            if isinstance(output, tuple):
+                single = output[0]
+            else:
+                single = output
+            # [1, 100, 1] → [100]
+            single = torch.sigmoid(single[0, :, 0]).cpu().numpy()
+
+        # 가운데 50프레임 (인덱스 25:75) 만 사용 — 양쪽 패딩 영역 제외
+        predictions.append(single[25:75])
+        ptr += 50
+        window_idx += 1
+        if window_idx % 10 == 0:
+            log_fn(f"  윈도우 {window_idx}/{total_windows}", "info")
+
+    all_preds = np.concatenate(predictions)
+    # 원본 프레임 수만큼만 잘라내기
+    return all_preds[:len(frames)]
+
+
+def predictions_to_scenes(preds: "np.ndarray", threshold: float = 0.5) -> list:
+    """
+    TransNetV2 예측값 → 장면 경계 (프레임 인덱스 기준).
+    반환: [(start_frame, end_frame), ...]
+    """
+    binary = (preds > threshold).astype(np.uint8)
+    scenes = []
+    start = 0
+    prev = 0
+    end_i = 0
+    for i, v in enumerate(binary):
+        if prev == 1 and v == 0:
+            start = i
+        if prev == 0 and v == 1 and i != 0:
+            scenes.append([start, i])
+        prev = v
+        end_i = i
+    # 마지막 장면 마무리
+    if prev == 0:
+        scenes.append([start, end_i])
+
+    if len(scenes) == 0:
+        return [(0, len(preds) - 1)]
+    return [(int(s), int(e)) for s, e in scenes]
+
+
+def detect_scenes_transnet(video_path: str, threshold: float, log_fn) -> list:
+    """TransNetV2로 장면 탐지. [(start_sec, end_sec), ...] 반환"""
+    if not NUMPY_AVAILABLE:
+        raise RuntimeError("numpy 필요: pip install numpy")
+    if not TORCH_AVAILABLE:
         raise RuntimeError(
-            f"{max_wait}초 동안 Scene Edit Detection이 컷을 생성하지 않았습니다.\n"
-            "가능한 원인:\n"
-            "1) Premiere Pro 버전이 이 기능을 지원하지 않음 (14.3 이상 필요)\n"
-            "2) 영상에 실제 장면 전환이 없음\n"
-            "3) Adobe Sensei ML 모델 로드 실패 — Premiere를 재시작 후 재시도\n"
-            "4) GPU 가속이 비활성화되어 있음 — 환경 설정에서 확인"
+            "PyTorch가 설치되지 않았습니다.\n"
+            "설치: pip install torch --index-url https://download.pytorch.org/whl/cpu"
+        )
+    if not TRANSNET_AVAILABLE:
+        raise RuntimeError(
+            "transnetv2-pytorch가 설치되지 않았습니다.\n"
+            "설치: pip install transnetv2-pytorch"
         )
 
-    # ── STEP 5: Read cuts ──
-    log_fn("[5/5] 최종 컷 경계 읽기...", "info")
-    data = _jsx_call(JSX_READ_CUTS, timeout=30)
-    if "error" in data:
-        raise RuntimeError(f"읽기 실패: {data['error']}")
+    # 1. 가중치 준비
+    weights_path = get_cache_dir() / "transnetv2-pytorch-weights.pth"
+    if not weights_path.exists():
+        download_transnet_weights(weights_path, log_fn)
+    else:
+        log_fn(f"✓ 캐시된 가중치 사용: {weights_path.name}", "success")
 
-    cuts = [(c["start"], c["end"]) for c in data.get("cuts", [])]
-    log_fn(f"✓ Premiere가 {len(cuts)}개 컷 감지", "success")
+    # 2. 모델 로드
+    log_fn("TransNetV2 모델 로드 중...", "info")
+    model = TransNetV2()
+    try:
+        state_dict = torch.load(str(weights_path), map_location="cpu", weights_only=True)
+    except TypeError:
+        state_dict = torch.load(str(weights_path), map_location="cpu")
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+    log_fn(f"  ✓ 디바이스: {device.upper()}", "success")
+
+    # 3. 프레임 추출
+    frames = extract_frames_transnet(video_path, log_fn)
+
+    # 4. 추론
+    t0 = time.time()
+    preds = transnet_predict(model, frames, log_fn)
+    log_fn(f"  ✓ 추론 완료 ({time.time()-t0:.1f}초)", "success")
+
+    # 5. 프레임 → 시간 변환
+    fps = get_video_fps(video_path)
+    log_fn(f"  ✓ FPS: {fps:.2f}", "info")
+
+    scene_frames = predictions_to_scenes(preds, threshold=threshold)
+    cuts = [(s / fps, (e + 1) / fps) for s, e in scene_frames]
+
+    log_fn(f"✓ TransNetV2가 {len(cuts)}개 컷 감지", "success")
     return cuts
 
 
-# ─── PySceneDetect ───
+# ─── PySceneDetect (폴백) ───
 def detect_scenes_pyscenedetect(video_path: str, detector_type: str,
                                   threshold: float, log_fn) -> list:
-    """PySceneDetect 실행. [(start_sec, end_sec), ...] 반환"""
     if not PYSCENEDETECT_AVAILABLE:
-        raise RuntimeError("PySceneDetect가 설치되지 않음: pip install scenedetect[opencv]")
+        raise RuntimeError("PySceneDetect 미설치: pip install scenedetect[opencv]")
 
     log_fn(f"PySceneDetect 분석 중 ({detector_type}, threshold={threshold:.1f})...", "info")
 
@@ -522,23 +367,22 @@ def detect_scenes_pyscenedetect(video_path: str, detector_type: str,
     return cuts
 
 
+# ─── GUI ───
 class SceneSplitterApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Scene Splitter")
-        self.root.geometry("720x780")
-        self.root.minsize(600, 640)
+        self.root.title("Scene Splitter — AI 장면 편집 탐지")
+        self.root.geometry("740x820")
+        self.root.minsize(640, 680)
         self.root.configure(bg=BG)
 
         self.input_path = tk.StringVar()
         self.output_dir = tk.StringVar(value=str(get_desktop_path()))
-        self.mode = tk.StringVar(value="premiere")  # premiere | pyscenedetect
+        self.mode = tk.StringVar(value="transnet")  # transnet | pyscenedetect
+        self.transnet_threshold = tk.DoubleVar(value=0.5)
+        self.transnet_threshold_text = tk.StringVar(value="0.50")
         self.threshold = tk.DoubleVar(value=27.0)
         self.threshold_text = tk.StringVar(value="27.0")
-        # Premiere Scene Edit Detection 옵션 (실제 다이얼로그와 동일)
-        self.premiere_apply_cuts = tk.BooleanVar(value=True)
-        self.premiere_create_bins = tk.BooleanVar(value=False)
-        self.premiere_create_markers = tk.BooleanVar(value=False)
         self.detector_type = tk.StringVar(value="content")
         self.save_thumbnails = tk.BooleanVar(value=True)
         self.is_running = False
@@ -547,7 +391,6 @@ class SceneSplitterApp:
         self._build_ui()
         self._check_environment()
 
-    # ─── 스타일 ───
     def _setup_styles(self):
         s = ttk.Style()
         s.theme_use("clam")
@@ -563,6 +406,8 @@ class SceneSplitterApp:
                     font=("Segoe UI", 9))
         s.configure("Value.TLabel", background=BG, foreground=ACCENT,
                     font=("Segoe UI", 10, "bold"))
+        s.configure("Badge.TLabel", background=SURFACE_2, foreground=ACCENT,
+                    font=("Segoe UI", 8, "bold"), padding=(6, 2))
 
         s.configure("TEntry",
                     fieldbackground=SURFACE, foreground=TEXT,
@@ -605,7 +450,6 @@ class SceneSplitterApp:
                     background=ACCENT, troughcolor=SURFACE,
                     borderwidth=0, lightcolor=ACCENT, darkcolor=ACCENT)
 
-    # ─── UI ───
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=24, style="App.TFrame")
         main.pack(fill="both", expand=True)
@@ -616,16 +460,15 @@ class SceneSplitterApp:
 
         title_row = ttk.Frame(header, style="App.TFrame")
         title_row.pack(fill="x")
-
         dot = tk.Canvas(title_row, width=14, height=14, bg=BG, highlightthickness=0)
         dot.create_oval(2, 2, 12, 12, fill=ACCENT, outline="")
         dot.pack(side="left", padx=(0, 8))
-
         ttk.Label(title_row, text="Scene Splitter", style="Title.TLabel").pack(side="left")
+        ttk.Label(title_row, text="AI 기반", style="Badge.TLabel").pack(side="left", padx=(8, 0))
 
         ttk.Label(header,
-                  text="장면 편집 탐지로 영상을 컷별로 자동 분할 + JPEG 섬네일 저장",
-                  style="Sub.TLabel").pack(anchor="w", pady=(4, 0))
+                  text="딥러닝 기반 장면 편집 탐지 · Premiere Pro Scene Edit Detection 대체",
+                  style="Sub.TLabel").pack(anchor="w", pady=(6, 0))
 
         # 입력 영상
         ttk.Label(main, text="입력 영상 파일", style="Field.TLabel").pack(anchor="w", pady=(0, 6))
@@ -643,40 +486,37 @@ class SceneSplitterApp:
             side="left", fill="x", expand=True, padx=(0, 8), ipady=4)
         ttk.Button(out_frame, text="찾아보기", command=self._browse_output).pack(side="right")
 
-        # 탐지 모드
-        ttk.Label(main, text="탐지 모드", style="Field.TLabel").pack(anchor="w", pady=(0, 6))
+        # 탐지 엔진
+        ttk.Label(main, text="탐지 엔진", style="Field.TLabel").pack(anchor="w", pady=(0, 6))
         mode_frame = ttk.Frame(main, style="App.TFrame")
         mode_frame.pack(fill="x", pady=(0, 12))
         ttk.Radiobutton(mode_frame,
-                        text="Premiere Pro Scene Edit Detection (Premiere 실행 필요)",
-                        variable=self.mode, value="premiere",
+                        text="TransNetV2 (딥러닝 SOTA · Premiere Pro 급 정확도, 권장)",
+                        variable=self.mode, value="transnet",
                         command=self._on_mode_change).pack(anchor="w", pady=2)
         ttk.Radiobutton(mode_frame,
-                        text="PySceneDetect (오프라인, ffmpeg만 필요)",
+                        text="PySceneDetect (전통 방식, 빠름, 경량)",
                         variable=self.mode, value="pyscenedetect",
                         command=self._on_mode_change).pack(anchor="w", pady=2)
 
-        # 옵션 컨테이너 (모드별 전환)
+        # 옵션 컨테이너
         self.options_frame = ttk.Frame(main, style="App.TFrame")
         self.options_frame.pack(fill="x", pady=(0, 12))
 
-        # Premiere 옵션 (실제 '장면 편집 탐지' 다이얼로그와 동일한 3개 체크박스)
-        self.premiere_opts = ttk.Frame(self.options_frame, style="App.TFrame")
-        ttk.Label(self.premiere_opts,
-                  text="Premiere '장면 편집 탐지' 옵션",
-                  style="Field.TLabel").pack(anchor="w", pady=(0, 4))
-        ttk.Checkbutton(self.premiere_opts,
-                        text="각 감지된 잘라내기 포인트에 잘라내기 적용 (필수)",
-                        variable=self.premiere_apply_cuts).pack(anchor="w", pady=2)
-        ttk.Checkbutton(self.premiere_opts,
-                        text="감지된 각 절단 지점에서 하위 클립 저장소 만들기",
-                        variable=self.premiere_create_bins).pack(anchor="w", pady=2)
-        ttk.Checkbutton(self.premiere_opts,
-                        text="감지된 잘라내기 포인트의 각각에 클립 마커 만들기",
-                        variable=self.premiere_create_markers).pack(anchor="w", pady=2)
-        ttk.Label(self.premiere_opts,
-                  text="Premiere Pro 2020 이상 필요. 민감도는 Premiere가 자동 결정합니다.",
-                  style="Hint.TLabel").pack(anchor="w", pady=(4, 0))
+        # TransNetV2 옵션
+        self.transnet_opts = ttk.Frame(self.options_frame, style="App.TFrame")
+        trow = ttk.Frame(self.transnet_opts, style="App.TFrame")
+        trow.pack(fill="x", pady=(0, 4))
+        ttk.Label(trow, text="민감도 (TransNetV2)", style="Field.TLabel").pack(side="left")
+        ttk.Label(trow, textvariable=self.transnet_threshold_text,
+                  style="Value.TLabel").pack(side="right")
+        ttk.Scale(self.transnet_opts, from_=0.1, to=0.9,
+                  variable=self.transnet_threshold, orient="horizontal",
+                  command=lambda v: self.transnet_threshold_text.set(f"{float(v):.2f}")).pack(
+                      fill="x", pady=(4, 4))
+        ttk.Label(self.transnet_opts,
+                  text="낮을수록 민감 (더 많이 자름). 기본 0.5 권장. GPU 있으면 자동 사용.",
+                  style="Hint.TLabel").pack(anchor="w")
 
         # PySceneDetect 옵션
         self.pyscene_opts = ttk.Frame(self.options_frame, style="App.TFrame")
@@ -689,17 +529,17 @@ class SceneSplitterApp:
         ]:
             ttk.Radiobutton(det_row, text=label, variable=self.detector_type,
                             value=value).pack(side="left", padx=(0, 12))
-
         thresh_row = ttk.Frame(self.pyscene_opts, style="App.TFrame")
         thresh_row.pack(fill="x", pady=(0, 4))
         ttk.Label(thresh_row, text="임계값", style="Field.TLabel").pack(side="left")
-        ttk.Label(thresh_row, textvariable=self.threshold_text, style="Value.TLabel").pack(side="right")
+        ttk.Label(thresh_row, textvariable=self.threshold_text,
+                  style="Value.TLabel").pack(side="right")
         ttk.Scale(self.pyscene_opts, from_=5, to=60, variable=self.threshold,
                   orient="horizontal",
                   command=lambda v: self.threshold_text.set(f"{float(v):.1f}")).pack(
                       fill="x", pady=(4, 4))
         ttk.Label(self.pyscene_opts,
-                  text="값이 낮을수록 더 많이 자릅니다 (기본 27)",
+                  text="낮을수록 더 많이 자름 (기본 27)",
                   style="Hint.TLabel").pack(anchor="w")
 
         self._on_mode_change()
@@ -717,10 +557,9 @@ class SceneSplitterApp:
         self.progress = ttk.Progressbar(main, mode="indeterminate")
         self.progress.pack(fill="x", pady=(0, 10))
 
-        # 로그 영역
+        # 로그
         log_wrap = tk.Frame(main, bg=BORDER, bd=0)
         log_wrap.pack(fill="both", expand=True)
-
         self.log = tk.Text(log_wrap, bg=SURFACE, fg=TEXT_DIM,
                            font=("Consolas", 9), bd=0, relief="flat",
                            padx=12, pady=10, wrap="word",
@@ -739,8 +578,8 @@ class SceneSplitterApp:
     def _on_mode_change(self):
         for child in self.options_frame.winfo_children():
             child.pack_forget()
-        if self.mode.get() == "premiere":
-            self.premiere_opts.pack(fill="x")
+        if self.mode.get() == "transnet":
+            self.transnet_opts.pack(fill="x")
         else:
             self.pyscene_opts.pack(fill="x")
 
@@ -750,15 +589,28 @@ class SceneSplitterApp:
             self._log("⚠ ffmpeg가 PATH에 없습니다 (필수).", "error")
             self._log("  Windows: winget install Gyan.FFmpeg", "info")
             ok = False
-        if not REQUESTS_AVAILABLE:
-            self._log("⚠ requests가 없습니다 (Premiere 모드에 필요): pip install requests", "error")
-        if not PYSCENEDETECT_AVAILABLE:
-            self._log("⚠ PySceneDetect 미설치 (오프라인 모드에 필요): pip install scenedetect[opencv]", "info")
+
+        self._log("의존성 체크:", "accent")
+        self._log(f"  numpy:              {'✓' if NUMPY_AVAILABLE else '✗ (pip install numpy)'}",
+                  "success" if NUMPY_AVAILABLE else "error")
+        self._log(f"  torch:              {'✓' if TORCH_AVAILABLE else '✗ (pip install torch)'}",
+                  "success" if TORCH_AVAILABLE else "error")
+        self._log(f"  transnetv2-pytorch: {'✓' if TRANSNET_AVAILABLE else '✗ (pip install transnetv2-pytorch)'}",
+                  "success" if TRANSNET_AVAILABLE else "error")
+        self._log(f"  scenedetect:        {'✓' if PYSCENEDETECT_AVAILABLE else '✗ (pip install scenedetect[opencv])'}",
+                  "success" if PYSCENEDETECT_AVAILABLE else "info")
+
+        if TORCH_AVAILABLE:
+            try:
+                gpu = "CUDA 사용 가능" if torch.cuda.is_available() else "CPU 모드"
+                self._log(f"  디바이스: {gpu}", "info")
+            except Exception:
+                pass
 
         if ok:
-            self._log("Scene Splitter 준비 완료", "success")
+            self._log("\nScene Splitter 준비 완료", "success")
             self._log(f"기본 출력 폴더: {self.output_dir.get()}", "info")
-            self._log("영상을 선택하고 모드를 고른 뒤 '분할 시작'을 누르세요.\n", "info")
+            self._log("영상을 선택하고 '분할 시작'을 누르세요.\n", "info")
         else:
             self.run_btn.config(state="disabled")
 
@@ -786,11 +638,9 @@ class SceneSplitterApp:
         self.log.see("end")
         self.root.update_idletasks()
 
-    # ─── 분할 실행 ───
     def _start_split(self):
         if self.is_running:
             return
-
         input_path = self.input_path.get().strip()
         output_dir = self.output_dir.get().strip()
 
@@ -822,22 +672,18 @@ class SceneSplitterApp:
             self._log("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━", "accent")
             self._log(f"입력: {Path(input_path).name}", "info")
             self._log(f"출력: {scene_dir}", "info")
-            self._log(f"모드: {self.mode.get()}", "info")
+            self._log(f"엔진: {self.mode.get()}", "info")
 
             # 1. 컷 탐지
             t0 = time.time()
-            if self.mode.get() == "premiere":
+            if self.mode.get() == "transnet":
                 try:
-                    cuts = detect_scenes_premiere(
-                        input_path,
-                        self.premiere_apply_cuts.get(),
-                        self.premiere_create_bins.get(),
-                        self.premiere_create_markers.get(),
-                        self._log)
+                    cuts = detect_scenes_transnet(
+                        input_path, self.transnet_threshold.get(), self._log)
                 except Exception as e:
-                    self._log(f"✗ Premiere Pro 모드 실패: {e}", "error")
+                    self._log(f"✗ TransNetV2 실패: {e}", "error")
                     if PYSCENEDETECT_AVAILABLE:
-                        self._log("→ PySceneDetect로 폴백합니다.", "info")
+                        self._log("→ PySceneDetect로 자동 폴백", "info")
                         cuts = detect_scenes_pyscenedetect(
                             input_path, self.detector_type.get(),
                             self.threshold.get(), self._log)
@@ -875,7 +721,7 @@ class SceneSplitterApp:
                 thumb_ok = True
                 if self.save_thumbnails.get():
                     thumb_path = thumb_dir / f"{video_name}-Scene-{num}.jpg"
-                    # 컷 시작에서 약간 안쪽 (0.05초 후) 프레임 추출 — 검은 프레임 회피
+                    # 시작 +0.05s 프레임 캡처 (검은 프레임/페이드 회피)
                     thumb_time = start + 0.05
                     thumb_ok = extract_jpeg_frame(input_path, thumb_time, str(thumb_path))
 
