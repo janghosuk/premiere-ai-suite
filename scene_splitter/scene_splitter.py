@@ -143,54 +143,100 @@ def pymiere_check_connection() -> bool:
 
 
 # ─── Premiere Pro Scene Edit Detection ───
+#
+# Premiere Pro의 실제 '장면 편집 탐지' 다이얼로그는 3개 옵션만 노출:
+#   1) 각 감지된 잘라내기 포인트에 잘라내기 적용  (applyCutsToTimeline)
+#   2) 감지된 각 절단 지점에서 하위 클립 저장소 만들기 (createSubclipBins)
+#   3) 감지된 잘라내기 포인트의 각각에 클립 마커 만들기 (createClipMarkers)
+#
+# QE DOM API 시그니처:
+#   qeTrackItem.setSceneEditDetection(applyCutsToTimeline, createSubclipBins, createClipMarkers)
+#   — 모두 boolean. 민감도 파라미터는 없음.
+#
+# 핵심 주의사항:
+# - 타임라인의 클립을 '선택'한 상태여야 동작
+# - setSceneEditDetection은 동기식 블로킹 호출. 영상 길이에 비례해 시간이 걸림
+#   (10분 영상 = 약 2~5분 소요)
+# - 호출 직후 track.clips를 다시 읽어야 잘라낸 결과가 반영됨
 PREMIERE_DETECT_JSX = r"""
 (function() {
     try {
         var videoPath = "__VIDEO_PATH__";
-        var sensitivity = __SENSITIVITY__;
+        var applyCuts = __APPLY_CUTS__;
+        var createBins = __CREATE_BINS__;
+        var createMarkers = __CREATE_MARKERS__;
 
         // 1. 영상 임포트
         var beforeCount = app.project.rootItem.children.numItems;
         var ok = app.project.importFiles([videoPath], true, app.project.rootItem, false);
         if (!ok) { return JSON.stringify({error: "임포트 실패"}); }
 
-        // 2. 임포트된 아이템 찾기
+        // 2. 임포트된 아이템 찾기 (가장 최근 추가된 것)
         var imported = null;
         var children = app.project.rootItem.children;
         for (var i = beforeCount; i < children.numItems; i++) {
-            imported = children[i];
-            break;
+            var child = children[i];
+            // FILE 타입 (비디오/오디오 클립)
+            if (child.type === 1 /* ProjectItemType.CLIP */ ||
+                child.type === 2 /* ProjectItemType.FILE */) {
+                imported = child;
+                break;
+            }
+            imported = child; // fallback
         }
         if (!imported) { return JSON.stringify({error: "임포트된 아이템을 찾을 수 없음"}); }
 
-        // 3. 시퀀스 생성 (영상 클릭으로 자동 매칭)
+        // 3. 시퀀스 생성 (클립 속성 자동 매칭)
         var seqName = "SceneDetect_" + (new Date()).getTime();
         app.project.createNewSequenceFromClips(seqName, [imported], app.project.rootItem);
         var seq = app.project.activeSequence;
         if (!seq) { return JSON.stringify({error: "시퀀스 생성 실패"}); }
 
-        // 4. QE DOM으로 Scene Edit Detection 실행
+        // 4. 비디오 트랙의 모든 클립 선택 (Scene Edit Detection은 선택된 클립 대상)
+        var track = seq.videoTracks[0];
+        if (!track || track.clips.numItems === 0) {
+            return JSON.stringify({error: "비디오 트랙에 클립 없음"});
+        }
+        var initialCount = track.clips.numItems;
+        for (var k = 0; k < track.clips.numItems; k++) {
+            track.clips[k].setSelected(true, k === 0);
+        }
+
+        // 5. QE DOM 활성화
         app.enableQE();
         var qeSeq = qe.project.getActiveSequence();
         if (!qeSeq) { return JSON.stringify({error: "QE 시퀀스 접근 실패"}); }
 
-        // 첫 비디오 트랙의 첫 클립에 Scene Edit Detection 적용
         var qeTrack = qeSeq.getVideoTrackAt(0);
-        if (!qeTrack || qeTrack.numItems === 0) {
-            return JSON.stringify({error: "비디오 트랙에 클립 없음"});
-        }
-        var qeClip = qeTrack.getItemAt(0);
-        // applyCutsToTimeline=true, generateClipMarkers=false, sensitivity=0~1
-        qeClip.setSceneEditDetection(true, false, sensitivity);
+        if (!qeTrack) { return JSON.stringify({error: "QE 트랙 접근 실패"}); }
 
-        // 5. 결과 읽기 - 시퀀스의 모든 클립 in/out 시간
-        var fps = seq.getSettings().videoFrameRate.seconds;
-        // ticksPerSecond = 254016000000 (Adobe 표준)
-        var TPS = 254016000000;
-        var track = seq.videoTracks[0];
+        if (qeTrack.numItems === 0) {
+            return JSON.stringify({error: "QE 트랙에 아이템 없음"});
+        }
+
+        // 6. 첫 번째 QE 트랙 아이템에 Scene Edit Detection 적용
+        //    (applyCutsToTimeline, createSubclipBins, createClipMarkers) — 모두 boolean
+        var qeClip = qeTrack.getItemAt(0);
+        if (!qeClip) { return JSON.stringify({error: "QE 클립 접근 실패"}); }
+
+        var detectResult;
+        try {
+            detectResult = qeClip.setSceneEditDetection(applyCuts, createBins, createMarkers);
+        } catch (detectErr) {
+            return JSON.stringify({
+                error: "setSceneEditDetection 호출 실패: " + detectErr.toString(),
+                hint: "Premiere Pro 버전이 QE DOM Scene Edit Detection을 지원하지 않을 수 있음 (2020 이상 필요)"
+            });
+        }
+
+        // 7. 결과 읽기 - 시퀀스의 모든 클립 in/out 시간
+        //    setSceneEditDetection은 동기식이므로 반환 직후 track.clips가 최신 상태
+        var TPS = 254016000000; // Adobe ticks per second
+        var finalTrack = seq.videoTracks[0];
+        var finalCount = finalTrack.clips.numItems;
         var cuts = [];
-        for (var j = 0; j < track.clips.numItems; j++) {
-            var c = track.clips[j];
+        for (var j = 0; j < finalCount; j++) {
+            var c = finalTrack.clips[j];
             var startSec = c.start.ticks / TPS;
             var endSec = c.end.ticks / TPS;
             cuts.push({start: startSec, end: endSec});
@@ -200,16 +246,20 @@ PREMIERE_DETECT_JSX = r"""
             ok: true,
             cuts: cuts,
             sequenceName: seqName,
-            count: cuts.length
+            initialClipCount: initialCount,
+            finalClipCount: finalCount,
+            detectReturn: (typeof detectResult === "undefined" ? "undefined" : String(detectResult))
         });
     } catch (e) {
-        return JSON.stringify({error: e.toString()});
+        return JSON.stringify({error: e.toString(), line: (e.line || "?")});
     }
 })();
 """
 
 
-def detect_scenes_premiere(video_path: str, sensitivity: float, log_fn) -> list:
+def detect_scenes_premiere(video_path: str, apply_cuts: bool,
+                           create_bins: bool, create_markers: bool,
+                           log_fn) -> list:
     """Premiere Pro의 Scene Edit Detection 실행. [(start_sec, end_sec), ...] 반환"""
     log_fn("Premiere Pro에 연결 중...", "info")
     if not pymiere_check_connection():
@@ -220,16 +270,18 @@ def detect_scenes_premiere(video_path: str, sensitivity: float, log_fn) -> list:
         )
     log_fn("✓ Premiere Pro 연결됨", "success")
 
-    # JSX 스크립트의 경로 이스케이프
+    # JSX 스크립트 파라미터 치환
     safe_path = video_path.replace("\\", "\\\\").replace('"', '\\"')
     script = PREMIERE_DETECT_JSX.replace("__VIDEO_PATH__", safe_path)
-    script = script.replace("__SENSITIVITY__", f"{sensitivity:.3f}")
+    script = script.replace("__APPLY_CUTS__", "true" if apply_cuts else "false")
+    script = script.replace("__CREATE_BINS__", "true" if create_bins else "false")
+    script = script.replace("__CREATE_MARKERS__", "true" if create_markers else "false")
 
-    log_fn("Scene Edit Detection 실행 중... (수십 초 ~ 수 분 소요)", "info")
-    log_fn("⚠ Premiere Pro 화면이 잠시 멈춘 것처럼 보일 수 있습니다.", "info")
+    log_fn("Scene Edit Detection 실행 중...", "info")
+    log_fn("⚠ 10분 영상 기준 2~5분 소요. Premiere 화면이 멈춘 것처럼 보일 수 있음.", "info")
 
     # 매우 긴 타임아웃 - Scene Edit Detection은 영상 길이에 비례
-    raw = pymiere_eval(script, timeout=1800)
+    raw = pymiere_eval(script, timeout=3600)
     raw = (raw or "").strip()
 
     if not raw:
@@ -241,9 +293,22 @@ def detect_scenes_premiere(video_path: str, sensitivity: float, log_fn) -> list:
         raise RuntimeError(f"응답 파싱 실패: {raw[:300]}")
 
     if "error" in data:
-        raise RuntimeError(f"Premiere 오류: {data['error']}")
+        hint = data.get("hint", "")
+        msg = data["error"] + (f"\n힌트: {hint}" if hint else "")
+        raise RuntimeError(msg)
+
+    initial = data.get("initialClipCount", "?")
+    final = data.get("finalClipCount", "?")
+    log_fn(f"  타임라인 클립: {initial} → {final}", "info")
 
     cuts = [(c["start"], c["end"]) for c in data.get("cuts", [])]
+
+    if len(cuts) <= 1:
+        log_fn("⚠ Premiere가 장면을 1개만 반환했습니다.", "error")
+        log_fn("  → Scene Edit Detection이 변화를 감지하지 못했거나,", "error")
+        log_fn("  → 현재 Premiere 버전이 QE DOM setSceneEditDetection을 지원하지 않을 수 있습니다.", "error")
+        log_fn("  → PySceneDetect 모드로 전환해보세요.", "info")
+
     log_fn(f"✓ Premiere가 {len(cuts)}개 컷 감지", "success")
     return cuts
 
@@ -283,8 +348,10 @@ class SceneSplitterApp:
         self.mode = tk.StringVar(value="premiere")  # premiere | pyscenedetect
         self.threshold = tk.DoubleVar(value=27.0)
         self.threshold_text = tk.StringVar(value="27.0")
-        self.sensitivity = tk.DoubleVar(value=0.5)
-        self.sensitivity_text = tk.StringVar(value="0.50")
+        # Premiere Scene Edit Detection 옵션 (실제 다이얼로그와 동일)
+        self.premiere_apply_cuts = tk.BooleanVar(value=True)
+        self.premiere_create_bins = tk.BooleanVar(value=False)
+        self.premiere_create_markers = tk.BooleanVar(value=False)
         self.detector_type = tk.StringVar(value="content")
         self.save_thumbnails = tk.BooleanVar(value=True)
         self.is_running = False
@@ -406,19 +473,23 @@ class SceneSplitterApp:
         self.options_frame = ttk.Frame(main, style="App.TFrame")
         self.options_frame.pack(fill="x", pady=(0, 12))
 
-        # Premiere 옵션 (민감도)
+        # Premiere 옵션 (실제 '장면 편집 탐지' 다이얼로그와 동일한 3개 체크박스)
         self.premiere_opts = ttk.Frame(self.options_frame, style="App.TFrame")
-        sens_row = ttk.Frame(self.premiere_opts, style="App.TFrame")
-        sens_row.pack(fill="x", pady=(0, 4))
-        ttk.Label(sens_row, text="민감도 (Premiere)", style="Field.TLabel").pack(side="left")
-        ttk.Label(sens_row, textvariable=self.sensitivity_text, style="Value.TLabel").pack(side="right")
-        ttk.Scale(self.premiere_opts, from_=0.1, to=1.0, variable=self.sensitivity,
-                  orient="horizontal",
-                  command=lambda v: self.sensitivity_text.set(f"{float(v):.2f}")).pack(
-                      fill="x", pady=(4, 4))
         ttk.Label(self.premiere_opts,
-                  text="값이 높을수록 더 많이 자릅니다 (기본 0.5)",
-                  style="Hint.TLabel").pack(anchor="w")
+                  text="Premiere '장면 편집 탐지' 옵션",
+                  style="Field.TLabel").pack(anchor="w", pady=(0, 4))
+        ttk.Checkbutton(self.premiere_opts,
+                        text="각 감지된 잘라내기 포인트에 잘라내기 적용 (필수)",
+                        variable=self.premiere_apply_cuts).pack(anchor="w", pady=2)
+        ttk.Checkbutton(self.premiere_opts,
+                        text="감지된 각 절단 지점에서 하위 클립 저장소 만들기",
+                        variable=self.premiere_create_bins).pack(anchor="w", pady=2)
+        ttk.Checkbutton(self.premiere_opts,
+                        text="감지된 잘라내기 포인트의 각각에 클립 마커 만들기",
+                        variable=self.premiere_create_markers).pack(anchor="w", pady=2)
+        ttk.Label(self.premiere_opts,
+                  text="Premiere Pro 2020 이상 필요. 민감도는 Premiere가 자동 결정합니다.",
+                  style="Hint.TLabel").pack(anchor="w", pady=(4, 0))
 
         # PySceneDetect 옵션
         self.pyscene_opts = ttk.Frame(self.options_frame, style="App.TFrame")
@@ -571,7 +642,11 @@ class SceneSplitterApp:
             if self.mode.get() == "premiere":
                 try:
                     cuts = detect_scenes_premiere(
-                        input_path, self.sensitivity.get(), self._log)
+                        input_path,
+                        self.premiere_apply_cuts.get(),
+                        self.premiere_create_bins.get(),
+                        self.premiere_create_markers.get(),
+                        self._log)
                 except Exception as e:
                     self._log(f"✗ Premiere Pro 모드 실패: {e}", "error")
                     if PYSCENEDETECT_AVAILABLE:
