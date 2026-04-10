@@ -144,171 +144,358 @@ def pymiere_check_connection() -> bool:
 
 # ─── Premiere Pro Scene Edit Detection ───
 #
-# Premiere Pro의 실제 '장면 편집 탐지' 다이얼로그는 3개 옵션만 노출:
-#   1) 각 감지된 잘라내기 포인트에 잘라내기 적용  (applyCutsToTimeline)
-#   2) 감지된 각 절단 지점에서 하위 클립 저장소 만들기 (createSubclipBins)
-#   3) 감지된 잘라내기 포인트의 각각에 클립 마커 만들기 (createClipMarkers)
+# 근본 문제 분석:
+# - Adobe Sensei 기반 Scene Edit Detection은 비동기 ML 작업
+# - 단일 JSX 호출 내에서 $.sleep으로 대기하면 ExtendScript가 메인 UI 스레드를 점유해
+#   백그라운드 ML 처리까지 멈춰버림
+# - 따라서 여러 Python 호출로 쪼개 Premiere가 실제 처리할 시간을 확보해야 함
 #
-# QE DOM API 시그니처:
-#   qeTrackItem.setSceneEditDetection(applyCutsToTimeline, createSubclipBins, createClipMarkers)
-#   — 모두 boolean. 민감도 파라미터는 없음.
-#
-# 핵심 주의사항:
-# - 타임라인의 클립을 '선택'한 상태여야 동작
-# - setSceneEditDetection은 동기식 블로킹 호출. 영상 길이에 비례해 시간이 걸림
-#   (10분 영상 = 약 2~5분 소요)
-# - 호출 직후 track.clips를 다시 읽어야 잘라낸 결과가 반영됨
-PREMIERE_DETECT_JSX = r"""
+# 전략:
+#   STEP 1 (setup):     프로젝트 확보 → 영상 임포트 → 시퀀스 생성 → 클립 선택
+#   STEP 2 (diagnose):  QE DOM 메서드 enumerate — setSceneEditDetection 존재 확인
+#   STEP 3 (trigger):   setSceneEditDetection 호출. 즉시 return
+#   STEP 4 (poll loop): Python이 주기적으로 클립 수를 조회 → 안정화 감지
+#   STEP 5 (read):      최종 컷 경계 읽기
+
+# ── STEP 1: 프로젝트/시퀀스/선택 준비 ──
+JSX_SETUP = r"""
 (function() {
     try {
         var videoPath = "__VIDEO_PATH__";
-        var applyCuts = __APPLY_CUTS__;
-        var createBins = __CREATE_BINS__;
-        var createMarkers = __CREATE_MARKERS__;
+
+        // 프로젝트가 없으면 생성 (엉뚱한 상태 방지)
+        if (!app.project || !app.project.rootItem) {
+            return JSON.stringify({error: "열린 프로젝트 없음. Premiere에서 프로젝트를 먼저 여세요."});
+        }
 
         // 1. 영상 임포트
         var beforeCount = app.project.rootItem.children.numItems;
         var ok = app.project.importFiles([videoPath], true, app.project.rootItem, false);
-        if (!ok) { return JSON.stringify({error: "임포트 실패"}); }
+        if (!ok) { return JSON.stringify({error: "importFiles 반환값 false"}); }
 
-        // 2. 임포트된 아이템 찾기 (가장 최근 추가된 것)
+        // 2. 임포트된 아이템 찾기
         var imported = null;
         var children = app.project.rootItem.children;
         for (var i = beforeCount; i < children.numItems; i++) {
             var child = children[i];
-            // FILE 타입 (비디오/오디오 클립)
-            if (child.type === 1 /* ProjectItemType.CLIP */ ||
-                child.type === 2 /* ProjectItemType.FILE */) {
+            if (child && child.type !== undefined && child.type !== 3 /* BIN */) {
                 imported = child;
                 break;
             }
-            imported = child; // fallback
         }
-        if (!imported) { return JSON.stringify({error: "임포트된 아이템을 찾을 수 없음"}); }
+        if (!imported && children.numItems > beforeCount) {
+            imported = children[beforeCount];
+        }
+        if (!imported) { return JSON.stringify({error: "임포트된 아이템을 못 찾음"}); }
 
-        // 3. 시퀀스 생성 (클립 속성 자동 매칭)
+        // 3. 미디어 분석 완료 대기 (최대 10초)
+        //    importFiles 직후엔 메타데이터가 아직 준비 안 될 수 있음
+        var mediaWait = 0;
+        while (mediaWait < 20) {
+            try {
+                var mp = imported.getMediaPath();
+                if (mp && mp.length > 0) break;
+            } catch (mpErr) {}
+            $.sleep(500);
+            mediaWait++;
+        }
+
+        // 4. 시퀀스 생성
         var seqName = "SceneDetect_" + (new Date()).getTime();
         app.project.createNewSequenceFromClips(seqName, [imported], app.project.rootItem);
         var seq = app.project.activeSequence;
         if (!seq) { return JSON.stringify({error: "시퀀스 생성 실패"}); }
 
-        // 4. 비디오 트랙의 모든 클립 선택 (Scene Edit Detection은 선택된 클립 대상)
+        // 5. 시퀀스를 명시적으로 active로 설정
+        app.project.activeSequence = seq;
+
+        // 6. 비디오 트랙 클립 선택
         var track = seq.videoTracks[0];
         if (!track || track.clips.numItems === 0) {
             return JSON.stringify({error: "비디오 트랙에 클립 없음"});
         }
-        var initialCount = track.clips.numItems;
         for (var k = 0; k < track.clips.numItems; k++) {
             track.clips[k].setSelected(true, k === 0);
         }
 
-        // 5. QE DOM 활성화
+        return JSON.stringify({
+            ok: true,
+            sequenceName: seqName,
+            initialCount: track.clips.numItems,
+            mediaWaitSec: mediaWait * 0.5,
+            pproVersion: app.version
+        });
+    } catch (e) {
+        return JSON.stringify({error: "SETUP 예외: " + e.toString(), line: (e.line || "?")});
+    }
+})();
+"""
+
+# ── STEP 2: QE DOM 메서드 enumerate (진단용) ──
+JSX_DIAGNOSE = r"""
+(function() {
+    try {
         app.enableQE();
+        if (typeof qe === "undefined" || !qe) {
+            return JSON.stringify({error: "qe 객체 자체가 없음. QE DOM 미지원 버전."});
+        }
         var qeSeq = qe.project.getActiveSequence();
-        if (!qeSeq) { return JSON.stringify({error: "QE 시퀀스 접근 실패"}); }
+        if (!qeSeq) { return JSON.stringify({error: "qe.project.getActiveSequence() null"}); }
 
         var qeTrack = qeSeq.getVideoTrackAt(0);
-        if (!qeTrack) { return JSON.stringify({error: "QE 트랙 접근 실패"}); }
+        if (!qeTrack) { return JSON.stringify({error: "qe 비디오 트랙 null"}); }
 
-        if (qeTrack.numItems === 0) {
-            return JSON.stringify({error: "QE 트랙에 아이템 없음"});
-        }
-
-        // 6. 첫 번째 QE 트랙 아이템에 Scene Edit Detection 적용
-        //    (applyCutsToTimeline, createSubclipBins, createClipMarkers) — 모두 boolean
+        var numItems = qeTrack.numItems;
         var qeClip = qeTrack.getItemAt(0);
-        if (!qeClip) { return JSON.stringify({error: "QE 클립 접근 실패"}); }
+        if (!qeClip) { return JSON.stringify({error: "qe 클립 null", numItems: numItems}); }
 
-        var detectResult;
-        try {
-            detectResult = qeClip.setSceneEditDetection(applyCuts, createBins, createMarkers);
-        } catch (detectErr) {
-            return JSON.stringify({
-                error: "setSceneEditDetection 호출 실패: " + detectErr.toString(),
-                hint: "Premiere Pro 버전이 QE DOM Scene Edit Detection을 지원하지 않을 수 있음 (2020 이상 필요)"
-            });
-        }
+        // 클립에서 setSceneEditDetection 메서드 존재 확인
+        var hasMethod = (typeof qeClip.setSceneEditDetection === "function");
 
-        // 7. 결과 읽기 - 시퀀스의 모든 클립 in/out 시간
-        //    setSceneEditDetection은 동기식이므로 반환 직후 track.clips가 최신 상태
-        var TPS = 254016000000; // Adobe ticks per second
-        var finalTrack = seq.videoTracks[0];
-        var finalCount = finalTrack.clips.numItems;
-        var cuts = [];
-        for (var j = 0; j < finalCount; j++) {
-            var c = finalTrack.clips[j];
-            var startSec = c.start.ticks / TPS;
-            var endSec = c.end.ticks / TPS;
-            cuts.push({start: startSec, end: endSec});
+        // 사용 가능한 메서드 리스트
+        var methods = [];
+        for (var key in qeClip) {
+            try {
+                if (typeof qeClip[key] === "function") methods.push(key);
+            } catch (_) {}
         }
 
         return JSON.stringify({
             ok: true,
-            cuts: cuts,
-            sequenceName: seqName,
-            initialClipCount: initialCount,
-            finalClipCount: finalCount,
-            detectReturn: (typeof detectResult === "undefined" ? "undefined" : String(detectResult))
+            hasSetSceneEditDetection: hasMethod,
+            qeTrackNumItems: numItems,
+            qeClipType: (qeClip.type || "?"),
+            qeClipName: (qeClip.name || "?"),
+            methods: methods.join(",")
         });
     } catch (e) {
-        return JSON.stringify({error: e.toString(), line: (e.line || "?")});
+        return JSON.stringify({error: "DIAGNOSE 예외: " + e.toString()});
+    }
+})();
+"""
+
+# ── STEP 3: Scene Edit Detection 호출 (여러 시그니처 시도) ──
+JSX_TRIGGER = r"""
+(function() {
+    try {
+        var applyCuts = __APPLY_CUTS__;
+        var createBins = __CREATE_BINS__;
+        var createMarkers = __CREATE_MARKERS__;
+
+        app.enableQE();
+        var qeSeq = qe.project.getActiveSequence();
+        if (!qeSeq) { return JSON.stringify({error: "active qe sequence 없음"}); }
+
+        var qeTrack = qeSeq.getVideoTrackAt(0);
+        var qeClip = qeTrack.getItemAt(0);
+        if (!qeClip) { return JSON.stringify({error: "qe 클립 없음"}); }
+
+        if (typeof qeClip.setSceneEditDetection !== "function") {
+            return JSON.stringify({
+                error: "setSceneEditDetection 메서드가 QE 클립에 존재하지 않음",
+                hint: "Premiere Pro 2020 (14.3) 이상 + 호환 GPU 필요"
+            });
+        }
+
+        // 호출 시도 — 3-arg 형식
+        var called = false;
+        var lastErr = null;
+        var usedSignature = null;
+
+        try {
+            qeClip.setSceneEditDetection(applyCuts, createBins, createMarkers);
+            called = true;
+            usedSignature = "3-arg";
+        } catch (e3) {
+            lastErr = e3.toString();
+            // 1-arg 폴백
+            try {
+                qeClip.setSceneEditDetection(applyCuts);
+                called = true;
+                usedSignature = "1-arg";
+            } catch (e1) {
+                lastErr = lastErr + " | 1-arg: " + e1.toString();
+            }
+        }
+
+        if (!called) {
+            return JSON.stringify({error: "호출 실패: " + lastErr});
+        }
+
+        return JSON.stringify({ok: true, usedSignature: usedSignature});
+    } catch (e) {
+        return JSON.stringify({error: "TRIGGER 예외: " + e.toString()});
+    }
+})();
+"""
+
+# ── STEP 4: 현재 타임라인 클립 수 조회 ──
+JSX_POLL_COUNT = r"""
+(function() {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) { return JSON.stringify({error: "active sequence 없음"}); }
+        var track = seq.videoTracks[0];
+        if (!track) { return JSON.stringify({error: "비디오 트랙 없음"}); }
+        return JSON.stringify({count: track.clips.numItems});
+    } catch (e) {
+        return JSON.stringify({error: e.toString()});
+    }
+})();
+"""
+
+# ── STEP 5: 최종 컷 경계 읽기 ──
+JSX_READ_CUTS = r"""
+(function() {
+    try {
+        var seq = app.project.activeSequence;
+        if (!seq) { return JSON.stringify({error: "active sequence 없음"}); }
+        var track = seq.videoTracks[0];
+        var TPS = 254016000000;
+        var cuts = [];
+        for (var j = 0; j < track.clips.numItems; j++) {
+            var c = track.clips[j];
+            cuts.push({
+                start: c.start.ticks / TPS,
+                end: c.end.ticks / TPS
+            });
+        }
+        return JSON.stringify({ok: true, cuts: cuts, count: cuts.length});
+    } catch (e) {
+        return JSON.stringify({error: e.toString()});
     }
 })();
 """
 
 
+def _jsx_call(script: str, timeout: int = 120) -> dict:
+    """JSX 실행 후 JSON 파싱"""
+    raw = pymiere_eval(script, timeout=timeout)
+    raw = (raw or "").strip()
+    if not raw:
+        raise RuntimeError("Premiere가 빈 응답 반환")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"JSON 파싱 실패: {raw[:300]}")
+
+
 def detect_scenes_premiere(video_path: str, apply_cuts: bool,
                            create_bins: bool, create_markers: bool,
                            log_fn) -> list:
-    """Premiere Pro의 Scene Edit Detection 실행. [(start_sec, end_sec), ...] 반환"""
+    """
+    Premiere Pro Scene Edit Detection — 멀티 스텝 폴링 방식.
+    Adobe Sensei가 비동기 ML로 처리하므로 각 단계 사이에 Premiere에 시간 확보.
+    """
     log_fn("Premiere Pro에 연결 중...", "info")
     if not pymiere_check_connection():
         raise RuntimeError(
             "Premiere Pro에 연결할 수 없습니다.\n"
-            "1) Premiere Pro가 실행 중인지 확인\n"
-            "2) Pymiere Link CEP 확장이 설치/활성화되었는지 확인"
+            "1) Premiere Pro가 실행 중이고 프로젝트가 열려 있는지 확인\n"
+            "2) Pymiere Link CEP 확장이 설치/활성화되었는지 확인\n"
+            "   (localhost:3000에서 응답해야 함)"
         )
-    log_fn("✓ Premiere Pro 연결됨", "success")
 
-    # JSX 스크립트 파라미터 치환
+    # ── STEP 1: Setup ──
+    log_fn("[1/5] 영상 임포트 + 시퀀스 생성...", "info")
     safe_path = video_path.replace("\\", "\\\\").replace('"', '\\"')
-    script = PREMIERE_DETECT_JSX.replace("__VIDEO_PATH__", safe_path)
-    script = script.replace("__APPLY_CUTS__", "true" if apply_cuts else "false")
-    script = script.replace("__CREATE_BINS__", "true" if create_bins else "false")
-    script = script.replace("__CREATE_MARKERS__", "true" if create_markers else "false")
+    setup_script = JSX_SETUP.replace("__VIDEO_PATH__", safe_path)
+    data = _jsx_call(setup_script, timeout=120)
+    if "error" in data:
+        raise RuntimeError(f"Setup 실패: {data['error']}")
+    seq_name = data.get("sequenceName", "?")
+    initial = data.get("initialCount", "?")
+    ppro_ver = data.get("pproVersion", "?")
+    log_fn(f"  ✓ Premiere {ppro_ver} / 시퀀스: {seq_name}", "success")
+    log_fn(f"  ✓ 초기 클립 수: {initial}", "info")
 
-    log_fn("Scene Edit Detection 실행 중...", "info")
-    log_fn("⚠ 10분 영상 기준 2~5분 소요. Premiere 화면이 멈춘 것처럼 보일 수 있음.", "info")
+    # ── STEP 2: Diagnose — setSceneEditDetection이 실제로 있는지 확인 ──
+    log_fn("[2/5] QE DOM 진단 중...", "info")
+    data = _jsx_call(JSX_DIAGNOSE, timeout=30)
+    if "error" in data:
+        raise RuntimeError(f"진단 실패: {data['error']}")
 
-    # 매우 긴 타임아웃 - Scene Edit Detection은 영상 길이에 비례
-    raw = pymiere_eval(script, timeout=3600)
-    raw = (raw or "").strip()
+    has_method = data.get("hasSetSceneEditDetection", False)
+    if not has_method:
+        methods = data.get("methods", "")
+        raise RuntimeError(
+            "setSceneEditDetection 메서드가 QE DOM 클립에 존재하지 않습니다.\n"
+            f"Premiere Pro 버전 호환성 문제일 가능성이 높습니다.\n"
+            f"사용 가능한 메서드: {methods[:500]}"
+        )
+    log_fn("  ✓ setSceneEditDetection 메서드 확인됨", "success")
 
-    if not raw:
-        raise RuntimeError("Premiere Pro에서 빈 응답")
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        raise RuntimeError(f"응답 파싱 실패: {raw[:300]}")
-
+    # ── STEP 3: Trigger (비동기 호출) ──
+    log_fn("[3/5] Scene Edit Detection 실행 트리거...", "info")
+    trigger_script = (
+        JSX_TRIGGER
+        .replace("__APPLY_CUTS__", "true" if apply_cuts else "false")
+        .replace("__CREATE_BINS__", "true" if create_bins else "false")
+        .replace("__CREATE_MARKERS__", "true" if create_markers else "false")
+    )
+    data = _jsx_call(trigger_script, timeout=60)
     if "error" in data:
         hint = data.get("hint", "")
-        msg = data["error"] + (f"\n힌트: {hint}" if hint else "")
+        msg = f"트리거 실패: {data['error']}"
+        if hint:
+            msg += f"\n힌트: {hint}"
         raise RuntimeError(msg)
+    log_fn(f"  ✓ 트리거 완료 (시그니처: {data.get('usedSignature', '?')})", "success")
 
-    initial = data.get("initialClipCount", "?")
-    final = data.get("finalClipCount", "?")
-    log_fn(f"  타임라인 클립: {initial} → {final}", "info")
+    # ── STEP 4: Poll — 클립 수가 안정될 때까지 대기 ──
+    log_fn("[4/5] 감지 진행 중 폴링...", "info")
+    log_fn("  ⚠ Adobe Sensei ML 분석 중. 영상 길이에 비례해 시간 소요.", "info")
+
+    last_count = int(initial) if isinstance(initial, int) else 1
+    stable_secs = 0
+    total_waited = 0
+    poll_interval = 3  # seconds
+    stable_threshold = 15  # 15초 이상 변화 없으면 완료로 판단
+    max_wait = 1800  # 최대 30분
+
+    while total_waited < max_wait:
+        time.sleep(poll_interval)
+        total_waited += poll_interval
+        try:
+            data = _jsx_call(JSX_POLL_COUNT, timeout=15)
+        except Exception as e:
+            log_fn(f"  폴링 일시 실패 ({e}), 재시도...", "info")
+            continue
+
+        if "error" in data:
+            log_fn(f"  폴링 에러: {data['error']}", "info")
+            continue
+
+        current = data.get("count", 0)
+        if current != last_count:
+            log_fn(f"  [{total_waited}s] 클립 수: {last_count} → {current}", "info")
+            last_count = current
+            stable_secs = 0
+        else:
+            stable_secs += poll_interval
+            if current > 1 and stable_secs >= stable_threshold:
+                log_fn(f"  ✓ 안정화 감지 ({current}개, {stable_secs}s 안정)", "success")
+                break
+            if total_waited % 15 == 0:
+                log_fn(f"  [{total_waited}s] 대기 중... 현재 {current}개", "info")
+
+    if last_count <= 1:
+        raise RuntimeError(
+            f"{max_wait}초 동안 Scene Edit Detection이 컷을 생성하지 않았습니다.\n"
+            "가능한 원인:\n"
+            "1) Premiere Pro 버전이 이 기능을 지원하지 않음 (14.3 이상 필요)\n"
+            "2) 영상에 실제 장면 전환이 없음\n"
+            "3) Adobe Sensei ML 모델 로드 실패 — Premiere를 재시작 후 재시도\n"
+            "4) GPU 가속이 비활성화되어 있음 — 환경 설정에서 확인"
+        )
+
+    # ── STEP 5: Read cuts ──
+    log_fn("[5/5] 최종 컷 경계 읽기...", "info")
+    data = _jsx_call(JSX_READ_CUTS, timeout=30)
+    if "error" in data:
+        raise RuntimeError(f"읽기 실패: {data['error']}")
 
     cuts = [(c["start"], c["end"]) for c in data.get("cuts", [])]
-
-    if len(cuts) <= 1:
-        log_fn("⚠ Premiere가 장면을 1개만 반환했습니다.", "error")
-        log_fn("  → Scene Edit Detection이 변화를 감지하지 못했거나,", "error")
-        log_fn("  → 현재 Premiere 버전이 QE DOM setSceneEditDetection을 지원하지 않을 수 있습니다.", "error")
-        log_fn("  → PySceneDetect 모드로 전환해보세요.", "info")
-
     log_fn(f"✓ Premiere가 {len(cuts)}개 컷 감지", "success")
     return cuts
 
