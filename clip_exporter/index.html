@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src * 'unsafe-inline' 'unsafe-eval'; img-src * data: blob:;">
+    <title>Clip Exporter</title>
+    <link rel="stylesheet" href="./css/style.css">
+</head>
+<body>
+    <div class="app">
+        <!-- 헤더 -->
+        <div class="header">
+            <div class="dot"></div>
+            <div style="flex: 1; min-width: 0;">
+                <div style="display: flex; align-items: center; gap: 6px;">
+                    <span class="title">Clip Exporter</span>
+                    <span class="badge">CEP</span>
+                </div>
+                <div class="subtitle">타임라인 클립 일괄 익스포트 + 썸네일</div>
+            </div>
+            <button id="refreshBtn" class="btn btn-secondary" title="시퀀스 정보 새로고침">⟳</button>
+        </div>
+
+        <!-- 시퀀스 정보 -->
+        <div class="info-card" id="seqInfo">
+            <div class="info-row">
+                <span class="info-label">시퀀스</span>
+                <span class="info-value" id="seqName">—</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">클립 수</span>
+                <span class="info-value" id="clipCount">—</span>
+            </div>
+            <div class="info-row">
+                <span class="info-label">총 길이</span>
+                <span class="info-value" id="totalDur">—</span>
+            </div>
+        </div>
+
+        <!-- 출력 폴더 -->
+        <div class="field">
+            <div class="field-label">출력 폴더</div>
+            <div class="input-row">
+                <input type="text" id="outputFolder" placeholder="C:/Users/.../Desktop/exports">
+                <button id="browseFolderBtn" class="btn">찾아보기</button>
+            </div>
+        </div>
+
+        <!-- 프리셋 파일 -->
+        <div class="field">
+            <div class="field-label">Export 프리셋 (.epr)</div>
+            <div class="input-row">
+                <input type="text" id="presetPath" placeholder="프리셋 파일을 선택하세요">
+                <button id="browsePresetBtn" class="btn">찾아보기</button>
+            </div>
+            <div class="field-hint">
+                💡 Premiere의 내보내기 패널에서 "프리셋 저장"으로 .epr 파일을 만든 뒤 여기서 선택하세요. 한 번 설정하면 기억됩니다.
+            </div>
+        </div>
+
+        <!-- 파일명 패턴 -->
+        <div class="field">
+            <div class="field-label">파일명 패턴</div>
+            <div class="input-row">
+                <input type="text" id="namePattern" value="{sequence}_Clip_{num}">
+                <select id="videoExt">
+                    <option value="mp4">.mp4</option>
+                    <option value="mov">.mov</option>
+                    <option value="mxf">.mxf</option>
+                </select>
+            </div>
+            <div class="field-hint">
+                사용 가능: <code>{sequence}</code>, <code>{num}</code> (001), <code>{name}</code>
+            </div>
+        </div>
+
+        <!-- 썸네일 옵션 -->
+        <div class="field">
+            <div class="checkbox-row">
+                <input type="checkbox" id="captureThumbnail" checked>
+                <label for="captureThumbnail">각 클립의 첫 프레임을 이미지로 캡처</label>
+            </div>
+            <div class="input-row" id="thumbFormatRow" style="padding-left: 22px;">
+                <select id="thumbnailFormat">
+                    <option value="jpg">JPEG (.jpg)</option>
+                    <option value="png">PNG (.png)</option>
+                    <option value="tiff">TIFF (.tiff)</option>
+                </select>
+                <div style="flex: 1;"></div>
+            </div>
+        </div>
+
+        <!-- 실행 버튼 -->
+        <button id="exportBtn" class="btn btn-primary">
+            ▶  타임라인 클립 일괄 익스포트
+        </button>
+
+        <!-- 진행바 -->
+        <div>
+            <div class="progress">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+            <div class="progress-text" id="progressText">대기 중</div>
+        </div>
+
+        <!-- 로그 -->
+        <div class="log-wrap" id="logWrap">
+            <div class="log-line dim">Clip Exporter 준비 완료</div>
+            <div class="log-line dim">시퀀스를 열고 '타임라인 클립 일괄 익스포트'를 누르세요.</div>
+        </div>
+    </div>
+
+    <script src="./js/CSInterface.js"></script>
+    <script src="./js/main.js"></script>
+</body>
+</html>

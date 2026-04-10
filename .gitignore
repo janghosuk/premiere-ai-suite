@@ -11,6 +11,8 @@
 !scene_splitter/**
 !premiere_ai_panel/
 !premiere_ai_panel/**
+!clip_exporter/
+!clip_exporter/**
 
 # 작업 폴더 안에서도 민감 파일 / 빌드 산출물 제외
 **/.env
