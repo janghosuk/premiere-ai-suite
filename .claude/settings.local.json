@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Claude_Preview__preview_start",
+      "Bash(pip install:*)",
+      "Bash(where python:*)",
+      "Bash(python -c \"import anthropic; print\\('anthropic OK:', anthropic.__version__\\)\")",
+      "Bash(/c/Python313/python.exe -m pip install anthropic pymiere requests)",
+      "Bash(/c/Python313/python.exe -m pip install anthropic pymiere requests --target \"/c/Users/hsjang/OneDrive/바탕 화면/_COwork/견적서/premiere_agent/lib\")",
+      "Bash(/c/Python313/python.exe -c \"import pymiere; import os; print\\(os.path.dirname\\(pymiere.__file__\\)\\)\")",
+      "Bash(git clone:*)",
+      "Bash(reg query:*)",
+      "Bash(/c/Python313/python.exe -m pip install setuptools)",
+      "Bash(/c/Python313/python.exe -m pip install setuptools --target \"/c/Users/hsjang/OneDrive/바탕 화면/_COwork/견적서/premiere_agent/lib\")",
+      "Bash(/c/Python313/python.exe -c \"import pymiere; print\\('OK'\\)\")",
+      "Bash(reg add:*)",
+      "Bash(/c/Python313/python.exe -c ':*)",
+      "Bash(curl -s http://localhost:3000 --connect-timeout 3)",
+      "Bash(curl -s http://localhost:3000 --connect-timeout 5)",
+      "Bash(/c/Python313/python.exe -m pip install scenedetect[opencv])",
+      "Bash(/c/Python313/python.exe -u -c ':*)"
+    ]
+  }
+}

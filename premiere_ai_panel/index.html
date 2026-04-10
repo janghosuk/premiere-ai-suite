@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Premiere AI Agent</title>
+    <link rel="stylesheet" href="./css/style.css">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="title">
+                <span class="title-dot"></span>
+                Premiere AI
+            </div>
+            <button id="clear-btn" class="btn-icon" title="대화 초기화">↻</button>
+        </header>
+
+        <div id="chat-box" class="chat-box"></div>
+
+        <div class="input-area">
+            <div class="input-wrap">
+                <textarea id="input-box" placeholder="무엇을 도와드릴까요?" rows="1"></textarea>
+                <button id="send-btn" class="btn-send" title="전송">↑</button>
+            </div>
+        </div>
+
+        <div id="status-bar" class="status">초기화 중...</div>
+    </div>
+
+    <script src="./js/CSInterface.js"></script>
+    <script src="./js/claude-api.js"></script>
+    <script src="./js/premiere-tools.js"></script>
+    <script src="./js/main.js"></script>
+</body>
+</html>
